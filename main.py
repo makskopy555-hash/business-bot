@@ -13,6 +13,9 @@ from aiogram.types import (
     BusinessConnection,
     BusinessMessagesDeleted,
     CallbackQuery,
+    InlineQuery,
+    InlineQueryResultArticle,
+    InputTextMessageContent,
     Message,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -30,6 +33,7 @@ DB_PATH = os.path.join(DATA_DIR, "business_bot.db")
 
 KEEP_DAYS = 30            # сколько дней хранить кэш сообщений
 AWAY_COOLDOWN = 6 * 3600  # автоответчик не чаще раза в 6 часов на один чат
+MUTE_NOTICE_COOLDOWN = 20  # «Пользователь в муте» не чаще раза в 20 секунд на один чат
 
 # Тарифы: ключ -> (название, дней). Цены добавите, когда заработает оплата.
 TARIFFS = {
@@ -42,6 +46,7 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 BOT_USERNAME = ""
+font_wait = set()  # кто сейчас в разделе «Шрифты» и ждёт текст
 
 # ─────────────────────────────────────────────
 # БАЗА (sqlite — файл рядом с ботом / на Volume)
@@ -69,6 +74,10 @@ db.executescript(
         conn_id TEXT, chat_id INTEGER, msg_id INTEGER,
         sender_id INTEGER, sender_name TEXT, text TEXT, ts INTEGER,
         PRIMARY KEY(conn_id, chat_id, msg_id)
+    );
+    CREATE TABLE IF NOT EXISTS mutes(
+        conn_id TEXT, chat_id INTEGER, name TEXT, last_notice INTEGER DEFAULT 0,
+        PRIMARY KEY(conn_id, chat_id)
     );
     CREATE TABLE IF NOT EXISTS away_log(
         conn_id TEXT, chat_id INTEGER, ts INTEGER,
@@ -178,8 +187,9 @@ ABOUT = (
     "🗑 сообщает, когда собеседник удалил сообщение, и показывает его текст\n"
     "✏️ показывает, как собеседник изменил сообщение (было → стало)\n"
     "🤖 автоответчик, когда вы не на связи\n"
-    "🔎 поиск по сохранённым сообщениям\n"
-    "🕶 подсказки по настройкам приватности Telegram\n\n"
+    "🔇 мут собеседников: бот отвечает в чате «Пользователь в муте»\n"
+    "🔤 красивые шрифты для текста (доступны всем)\n"
+    "🔎 поиск по сохранённым сообщениям\n\n"
     "🔒 Уведомления видите только вы. Бот хранит текст сообщений "
     f"{KEEP_DAYS} дней, фото/видео/файлы не скачивает."
 )
@@ -189,6 +199,7 @@ def tariffs_kb():
     kb = InlineKeyboardBuilder()
     for key, (title, _) in TARIFFS.items():
         kb.button(text=f"💳 {title}", callback_data=f"buy_{key}")
+    kb.button(text="🔤 Шрифты", callback_data="fonts")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -198,9 +209,10 @@ def cabinet_kb():
     kb.button(text="⚙️ Настройки", callback_data="settings")
     kb.button(text="🔌 Как подключить", callback_data="howto")
     kb.button(text="📊 Статистика", callback_data="stats")
-    kb.button(text="🕶 Приватность", callback_data="privacy")
+    kb.button(text="🔇 Мут", callback_data="mute_menu")
+    kb.button(text="🔤 Шрифты", callback_data="fonts")
     kb.button(text="💳 Тарифы", callback_data="tariffs")
-    kb.adjust(2, 2, 1)
+    kb.adjust(2, 2, 2)
     return kb.as_markup()
 
 
@@ -236,6 +248,7 @@ async def menu_cmd(message: Message):
 
 @dp.callback_query(F.data == "begin")
 async def begin(cb: CallbackQuery):
+    font_wait.discard(cb.from_user.id)
     if is_active(cb.from_user.id):
         await safe_edit(cb, cabinet_text(cb.from_user.id), cabinet_kb())
     else:
@@ -268,6 +281,7 @@ async def buy(cb: CallbackQuery):
 
 @dp.callback_query(F.data == "cabinet")
 async def cabinet(cb: CallbackQuery):
+    font_wait.discard(cb.from_user.id)
     if not is_active(cb.from_user.id):
         await safe_edit(cb, "💳 <b>Выберите тариф</b>", tariffs_kb())
         return
@@ -292,25 +306,6 @@ async def howto(cb: CallbackQuery):
         "4. Включите право «Отвечать на сообщения» (нужно для автоответчика)\n\n"
         "Готово — бот пришлёт подтверждение. Отключить можно там же в любой момент.\n\n"
         "ℹ️ Если в настройках нет раздела «Telegram для бизнеса» — обновите Telegram до последней версии.",
-        back_kb(),
-    )
-
-
-@dp.callback_query(F.data == "privacy")
-async def privacy(cb: CallbackQuery):
-    if not require_active(cb):
-        await cb.answer("Нужна активная подписка", show_alert=True)
-        return
-    await safe_edit(
-        cb,
-        "🕶 <b>Приватность в Telegram</b>\n\n"
-        "Бот не может менять ваш статус, но Telegram умеет это сам:\n\n"
-        "• <b>Скрыть «был(а) в сети»:</b> Настройки → Конфиденциальность → Время захода\n"
-        "• <b>Кто видит фото, звонки, пересылки:</b> там же, в разделе «Конфиденциальность»\n"
-        "• <b>Время прочтения</b> — настройка доступна владельцам Premium\n"
-        "• <b>Тихие сообщения:</b> зажмите кнопку отправки → «Без звука»\n"
-        "• <b>Отложенные сообщения:</b> зажмите отправку → «Запланировать»\n\n"
-        "ℹ️ Статус «печатает…» скрыть нельзя — такой настройки в Telegram нет.",
         back_kb(),
     )
 
@@ -413,6 +408,284 @@ async def find(message: Message):
 
 
 # ─────────────────────────────────────────────
+# ШРИФТЫ
+# ─────────────────────────────────────────────
+
+_LAT = "abcdefghijklmnopqrstuvwxyz"
+_LAT_UP = _LAT.upper()
+FONT_MAX = 80
+
+
+def _offset_map(upper_start, lower_start, digit_start=None, exceptions=None):
+    m = {}
+    for i, ch in enumerate(_LAT_UP):
+        m[ch] = chr(upper_start + i)
+    for i, ch in enumerate(_LAT):
+        m[ch] = chr(lower_start + i)
+    if digit_start:
+        for i, ch in enumerate("0123456789"):
+            m[ch] = chr(digit_start + i)
+    if exceptions:
+        m.update(exceptions)
+    return m
+
+
+def _custom_map(lat_target, cyr, fold=True, overrides=None):
+    assert len(lat_target) == 26, "в шрифте должно быть ровно 26 латинских букв"
+    m = {}
+    for a, b in zip(_LAT, lat_target):
+        m[a] = b
+        if fold:
+            m[a.upper()] = b
+    for a, b in cyr.items():
+        m[a] = b
+        if fold:
+            m[a.upper()] = b
+    if overrides:
+        m.update(overrides)
+    return m
+
+
+_CIRCLED = _offset_map(0x24B6, 0x24D0)
+_CIRCLED.update({str(i): chr(0x2460 + i - 1) for i in range(1, 10)})
+_CIRCLED["0"] = "\u24ea"
+
+FONT_STYLES = [
+    ("Жирный", _offset_map(0x1D400, 0x1D41A, 0x1D7CE)),
+    ("Курсив", _offset_map(0x1D608, 0x1D622)),
+    ("Жирный курсив", _offset_map(0x1D63C, 0x1D656)),
+    ("Моноширинный", _offset_map(0x1D670, 0x1D68A, 0x1D7F6)),
+    ("Двойной", _offset_map(
+        0x1D538, 0x1D552, 0x1D7D8,
+        {"C": "ℂ", "H": "ℍ", "N": "ℕ", "P": "ℙ", "Q": "ℚ", "R": "ℝ", "Z": "ℤ"},
+    )),
+    ("Рукописный", _offset_map(0x1D4D0, 0x1D4EA)),
+    ("Готика", _offset_map(0x1D56C, 0x1D586)),
+    ("В кружках", _CIRCLED),
+    ("ξα Греческий", _custom_map(
+        "αβϲԁεƒɡɦιʝκɭϻηορɋгѕτυνω𑀌γζ",
+        {"т": "τ", "е": "ε", "к": "ӄ", "с": "ϲ", "а": "α", "о": "ο", "р": "ρ",
+         "и": "ι", "н": "η", "в": "β", "м": "ϻ", "х": "χ", "ё": "ε"},
+        overrides={"E": "ξ", "Т": "Ͳ", "Е": "ξ"},
+    )),
+    ("ϱχ Греческий 2", _custom_map(
+        "αβϲԁϱƒɡɦιʝκɭɱηορɋгѕτυνωχγζ",
+        {"т": "τ", "е": "ϱ", "к": "κ", "с": "с", "а": "α", "о": "ο", "р": "ρ",
+         "и": "ι", "н": "η", "в": "β", "м": "ɱ", "х": "χ", "ё": "ϱ"},
+    )),
+    ("ᘓ᙭ Канадский", _custom_map(
+        "ᕕᗷᑕᗪᘓᖴᘜᕼᏆᒍᖉᒐᕬᑎᗝᖘᑫᖇᔕᎢᑌᐯᗯ᙭Ꭹᘔ",
+        {"т": "Ꭲ", "е": "ᘓ", "к": "ᖉ", "с": "ᑕ", "а": "ᕕ", "в": "ᗷ", "м": "ᕬ",
+         "н": "ᕼ", "о": "ᗝ", "р": "ᖘ", "х": "᙭", "у": "Ꭹ", "ё": "ᘓ"},
+    )),
+    ("ᴀʙᴄ Малые капсы", _custom_map(
+        "ᴀʙᴄᴅᴇꜰɢʜɪᴊᴋlʍɴᴏᴩǫʀꜱᴛᴜᴠᴡxʏᴢ",
+        {"е": "ᴇ", "к": "ᴋ", "с": "ᴄ", "т": "ᴛ", "а": "ᴀ", "о": "ᴏ", "р": "ᴩ",
+         "м": "ʍ", "н": "ʜ", "в": "ʙ"},
+        fold=False,
+    )),
+]
+
+
+def stylize(mapping, text: str) -> str:
+    return "".join(mapping.get(ch, ch) for ch in text)
+
+
+def fonts_text(text: str) -> str:
+    text = text.strip()[:FONT_MAX]
+    parts = ["🔤 <b>Ваш текст в шрифтах</b>\n(нажмите на вариант, чтобы скопировать)\n"]
+    for title, mp in FONT_STYLES:
+        parts.append(f"\n<b>{esc(title)}</b>\n<code>{esc(stylize(mp, text))}</code>")
+    return "".join(parts)
+
+
+@dp.callback_query(F.data == "fonts")
+async def fonts(cb: CallbackQuery):
+    font_wait.add(cb.from_user.id)
+    await safe_edit(
+        cb,
+        "🔤 <b>Шрифты</b>\n\n"
+        f"Отправьте мне любой текст (до {FONT_MAX} символов) — пришлю его во всех шрифтах. "
+        "Нажмите на нужный вариант, чтобы скопировать.\n\n"
+        f"Без захода в бота: в любом чате напишите <code>@{esc(BOT_USERNAME)} ваш текст</code> "
+        "и выберите шрифт из списка.\n\n"
+        "Можно и командой: <code>/font текст</code>",
+        back_kb(),
+    )
+
+
+@dp.message(Command("font"))
+async def font_cmd(message: Message):
+    text = message.text.partition(" ")[2].strip()
+    if not text:
+        font_wait.add(message.from_user.id)
+        await message.answer("🔤 Отправьте текст — пришлю его во всех шрифтах.", reply_markup=back_kb())
+        return
+    await message.answer(fonts_text(text), reply_markup=back_kb())
+
+
+@dp.message(F.text, F.chat.type == "private", ~F.text.startswith("/"))
+async def font_plain(message: Message):
+    if message.from_user.id in font_wait:
+        await message.answer(fonts_text(message.text), reply_markup=back_kb())
+
+
+@dp.inline_query()
+async def inline_fonts(iq: InlineQuery):
+    text = iq.query.strip()[:FONT_MAX]
+    if not text:
+        await iq.answer([], cache_time=1)
+        return
+    results = []
+    for i, (title, mp) in enumerate(FONT_STYLES):
+        styled = stylize(mp, text)
+        results.append(
+            InlineQueryResultArticle(
+                id=str(i),
+                title=title,
+                description=styled,
+                input_message_content=InputTextMessageContent(message_text=styled, parse_mode=None),
+            )
+        )
+    await iq.answer(results, cache_time=1, is_personal=False)
+
+
+# ─────────────────────────────────────────────
+# МУТ
+# ─────────────────────────────────────────────
+
+def owner_conns(uid: int) -> list:
+    return [r["conn_id"] for r in q("SELECT conn_id FROM connections WHERE owner_id=?", (uid,))]
+
+
+def muted_list(uid: int) -> list:
+    conns = owner_conns(uid)
+    if not conns:
+        return []
+    marks = ",".join("?" * len(conns))
+    return q(
+        f"SELECT conn_id, chat_id, name FROM mutes WHERE conn_id IN ({marks}) ORDER BY rowid DESC",
+        tuple(conns),
+    ).fetchall()
+
+
+def mute_screen(uid: int):
+    rows = muted_list(uid)
+    kb = InlineKeyboardBuilder()
+    for r in rows[:15]:
+        kb.button(text=f"🔊 Размут: {r['name'][:25]}", callback_data=f"um_{r['chat_id']}")
+    kb.button(text="➕ Замутить собеседника", callback_data="mute_pick")
+    kb.button(text="⬅️ Назад", callback_data="cabinet")
+    kb.adjust(1)
+    listing = "\n".join(f"• {esc(r['name'])}" for r in rows) if rows else "никого"
+    text = (
+        "🔇 <b>Мут</b>\n\n"
+        "Замученный собеседник по-прежнему может вам писать, но на его сообщения бот отвечает "
+        "в чате: «Пользователь в муте» с кнопкой «Размут». Нажать её может только вы.\n\n"
+        "Как замутить:\n"
+        "• кнопкой «➕ Замутить собеседника» ниже\n"
+        "• или командой <code>/mute</code> прямо в чате с человеком "
+        "(<code>/unmute</code> — снять). Саму команду собеседник увидит, удалите её сами.\n\n"
+        f"<b>В муте сейчас:</b>\n{listing}"
+    )
+    return text, kb.as_markup()
+
+
+@dp.callback_query(F.data == "mute_menu")
+async def mute_menu(cb: CallbackQuery):
+    if not require_active(cb):
+        await cb.answer("Нужна активная подписка", show_alert=True)
+        return
+    text, kb = mute_screen(cb.from_user.id)
+    await safe_edit(cb, text, kb)
+
+
+@dp.callback_query(F.data == "mute_pick")
+async def mute_pick(cb: CallbackQuery):
+    if not require_active(cb):
+        await cb.answer("Нужна активная подписка", show_alert=True)
+        return
+    uid = cb.from_user.id
+    conns = owner_conns(uid)
+    if not conns:
+        await safe_edit(
+            cb,
+            "Сначала подключите бота в Telegram Business (раздел «Как подключить»).",
+            back_kb("mute_menu"),
+        )
+        return
+    marks = ",".join("?" * len(conns))
+    rows = q(
+        f"SELECT chat_id, sender_name, MAX(ts) AS t FROM messages "
+        f"WHERE conn_id IN ({marks}) AND sender_id != ? "
+        f"AND chat_id NOT IN (SELECT chat_id FROM mutes WHERE conn_id IN ({marks})) "
+        f"GROUP BY chat_id ORDER BY t DESC LIMIT 8",
+        (*conns, uid, *conns),
+    ).fetchall()
+    kb = InlineKeyboardBuilder()
+    for r in rows:
+        kb.button(text=f"🔇 {r['sender_name'][:30]}", callback_data=f"md_{r['chat_id']}")
+    kb.button(text="⬅️ Назад", callback_data="mute_menu")
+    kb.adjust(1)
+    text = (
+        "Выберите, кого замутить (последние собеседники):"
+        if rows else
+        "Пока нет сообщений от собеседников. Как только вам напишут, они появятся здесь."
+    )
+    await safe_edit(cb, text, kb.as_markup())
+
+
+@dp.callback_query(F.data.startswith("md_"))
+async def mute_do(cb: CallbackQuery):
+    if not require_active(cb):
+        await cb.answer("Нужна активная подписка", show_alert=True)
+        return
+    uid = cb.from_user.id
+    chat_id = int(cb.data[3:])
+    conns = owner_conns(uid)
+    row = None
+    if conns:
+        marks = ",".join("?" * len(conns))
+        row = q(
+            f"SELECT conn_id, sender_name FROM messages WHERE chat_id=? AND sender_id != ? "
+            f"AND conn_id IN ({marks}) ORDER BY ts DESC LIMIT 1",
+            (chat_id, uid, *conns),
+        ).fetchone()
+    if not row:
+        await cb.answer("Собеседник не найден", show_alert=True)
+        return
+    q("INSERT OR REPLACE INTO mutes VALUES(?,?,?,0)", (row["conn_id"], chat_id, row["sender_name"]))
+    text, kb = mute_screen(uid)
+    await safe_edit(cb, text, kb)
+
+
+@dp.callback_query(F.data.startswith("um_"))
+async def unmute(cb: CallbackQuery):
+    chat_id = int(cb.data[3:])
+    conns = owner_conns(cb.from_user.id)
+    if not conns:
+        await cb.answer("Размутить может только владелец чата", show_alert=True)
+        return
+    marks = ",".join("?" * len(conns))
+    cur = q(f"DELETE FROM mutes WHERE chat_id=? AND conn_id IN ({marks})", (chat_id, *conns))
+    if cur.rowcount == 0:
+        await cb.answer("Мут уже снят или это не ваш чат", show_alert=True)
+        return
+    if cb.message is None:
+        await cb.answer("Мут снят")
+        return
+    if getattr(cb.message, "business_connection_id", None):
+        try:
+            await cb.message.edit_text("🔊 Мут снят")
+        except Exception:
+            pass
+        await cb.answer("Мут снят")
+    else:
+        text, kb = mute_screen(cb.from_user.id)
+        await safe_edit(cb, text, kb)
+
+
+# ─────────────────────────────────────────────
 # BUSINESS: подключение, сообщения, удаления, правки
 # ─────────────────────────────────────────────
 
@@ -442,6 +715,25 @@ async def on_business_message(m: Message):
         return
 
     sender = m.from_user
+    conn = m.business_connection_id
+
+    # команды владельца прямо в чате: /mute и /unmute
+    if sender and sender.id == owner and m.text:
+        cmd = m.text.split()[0].split("@")[0].lower()
+        if cmd in ("/mute", "/unmute"):
+            name = m.chat.full_name or m.chat.username or str(m.chat.id)
+            if cmd == "/mute":
+                q("INSERT OR REPLACE INTO mutes VALUES(?,?,?,0)", (conn, m.chat.id, name))
+                note = f"🔇 {esc(name)} в муте."
+            else:
+                q("DELETE FROM mutes WHERE conn_id=? AND chat_id=?", (conn, m.chat.id))
+                note = f"🔊 Мут с {esc(name)} снят."
+            try:
+                await bot.send_message(owner, note)
+            except Exception:
+                pass
+            return
+
     q(
         "INSERT OR REPLACE INTO messages VALUES(?,?,?,?,?,?,?)",
         (
@@ -451,6 +743,30 @@ async def on_business_message(m: Message):
             describe(m), int(time.time()),
         ),
     )
+
+    # мут: на сообщения замученного бот отвечает в чате и дальше ничего не делает
+    if sender and sender.id != owner:
+        muted = q(
+            "SELECT last_notice FROM mutes WHERE conn_id=? AND chat_id=?", (conn, m.chat.id)
+        ).fetchone()
+        if muted:
+            if time.time() - muted["last_notice"] > MUTE_NOTICE_COOLDOWN:
+                kb = InlineKeyboardBuilder()
+                kb.button(text="🔊 Размут", callback_data=f"um_{m.chat.id}")
+                try:
+                    await bot.send_message(
+                        m.chat.id,
+                        "🔇 Пользователь в муте",
+                        reply_markup=kb.as_markup(),
+                        business_connection_id=conn,
+                    )
+                    q(
+                        "UPDATE mutes SET last_notice=? WHERE conn_id=? AND chat_id=?",
+                        (int(time.time()), conn, m.chat.id),
+                    )
+                except Exception:
+                    logging.exception("mute notice failed")
+            return
 
     # автоответчик: только на сообщения собеседника, не чаще раза в AWAY_COOLDOWN
     u = ensure_user(owner)
@@ -551,10 +867,11 @@ async def on_business_delete(ev: BusinessMessagesDeleted):
 @dp.message(Command("help"))
 async def help_cmd(message: Message):
     if not is_admin(message.from_user.id):
-        await message.answer("Команды: /start, /menu, /find, /setaway")
+        await message.answer("Команды: /start, /menu, /find, /setaway, /font, /mute, /unmute")
         return
     await message.answer(
         "🛠 <b>Админ-команды</b>\n\n"
+        "Для владельцев: /mute и /unmute в чате с человеком, /font текст\n\n"
         "/give id дни — выдать/продлить доступ (например /give 123456 30)\n"
         "/revoke id — отозвать доступ\n"
         "/check id — статус пользователя\n"
