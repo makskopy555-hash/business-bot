@@ -2,6 +2,7 @@ import asyncio
 import html
 import logging
 import os
+import random
 import re
 import sqlite3
 import time
@@ -90,6 +91,12 @@ db.executescript(
 db.commit()
 try:
     db.execute("ALTER TABLE users ADD COLUMN font_idx INTEGER DEFAULT -1")
+    db.commit()
+except sqlite3.OperationalError:
+    pass  # колонка уже есть
+try:
+    db.execute("ALTER TABLE users ADD COLUMN verified INTEGER DEFAULT 0")
+    db.execute("UPDATE users SET verified=1 WHERE sub_until > 0")
     db.commit()
 except sqlite3.OperationalError:
     pass  # колонка уже есть
@@ -237,9 +244,173 @@ def cabinet_text(uid: int) -> str:
     return f"🕵️ <b>Business Assistant</b>\n\n✅ Подписка активна: <b>{status}</b>\n\nВыберите раздел:"
 
 
+# ─────────────────────────────────────────────
+# ПРОВЕРКА НА БОТА (капча при /start)
+# ─────────────────────────────────────────────
+
+CAPTCHA_STEPS = 3
+CAPTCHA_STEP_TIME = 60    # секунд на каждый шаг
+CAPTCHA_MIN_DELAY = 1.0   # ответ быстрее секунды — так отвечает скрипт, а не человек
+CAPTCHA_MAX_FAILS = 3     # ошибок до блокировки
+CAPTCHA_LOCK = 600        # блокировка на 10 минут
+
+captcha = {}        # user_id -> текущая проверка
+captcha_fails = {}  # user_id -> число ошибок (не сбрасывается повторным /start)
+captcha_lock = {}   # user_id -> время, до которого проверка заблокирована
+
+_POOLS = [
+    ["🍎", "🍌", "🍇", "🍓", "🍉", "🍒", "🍑", "🥝"],
+    ["🐶", "🐱", "🐭", "🐹", "🐰", "🦊", "🐻", "🐼"],
+    ["🚗", "🚕", "🚌", "🚓", "🚑", "🚒", "🚜", "🚲"],
+    ["⚽", "🏀", "🏈", "⚾", "🎾", "🏐", "🏉", "🎱"],
+]
+_WORDS = ["телефон", "сообщение", "ключ", "планета", "программа", "бот", "клавиатура", "дорога", "облако", "мышь"]
+
+
+def _numeric_options(ans: int, extra: list):
+    pool = [x for x in dict.fromkeys(extra + [ans + 1, ans - 1, ans + 2, ans - 2, ans + 3]) if x != ans and x > 0]
+    opts = [ans] + pool[:3]
+    random.shuffle(opts)
+    return [str(o) for o in opts], opts.index(ans)
+
+
+def _puzzle_math():
+    if random.random() < 0.5:
+        a, b, c = random.randint(3, 9), random.randint(2, 9), random.randint(2, 5)
+        ans = a + b * c
+        opts, idx = _numeric_options(ans, [(a + b) * c])  # типичная ошибка: считать слева направо
+        return f"Сколько будет <b>{a} + {b} × {c}</b>?", opts, idx, 2
+    a, b = random.randint(3, 9), random.randint(2, 6)
+    c = random.randint(1, min(9, a * b - 1))
+    ans = a * b - c
+    opts, idx = _numeric_options(ans, [a * (b - c)])
+    return f"Сколько будет <b>{a} × {b} − {c}</b>?", opts, idx, 2
+
+
+def _puzzle_odd():
+    main, other = random.sample(_POOLS, 2)
+    items = random.sample(main, 5)
+    odd = random.choice(other)
+    opts = items + [odd]
+    random.shuffle(opts)
+    return "Нажмите на <b>лишний</b> предмет:", opts, opts.index(odd), 3
+
+
+def _puzzle_word():
+    w = random.choice(_WORDS)
+    opts, idx = _numeric_options(len(w), [])
+    return f"Сколько букв в слове <b>«{w}»</b>?", opts, idx, 2
+
+
+_PUZZLES = [_puzzle_math, _puzzle_odd, _puzzle_word]
+
+
+def _next_puzzle(sess: dict) -> None:
+    text, opts, correct, cols = _PUZZLES[sess["step"] - 1]()
+    sess.update(
+        text=text, opts=opts, correct=correct, cols=cols,
+        nonce="".join(random.choices("0123456789abcdef", k=6)),
+        shown=time.time(),
+    )
+
+
+def _captcha_view(sess: dict, note: str = ""):
+    kb = InlineKeyboardBuilder()
+    for i, o in enumerate(sess["opts"]):
+        # в callback_data только номер кнопки и одноразовый код, сам ответ там не виден
+        kb.button(text=o, callback_data=f"cap_{sess['nonce']}_{i}")
+    kb.adjust(sess["cols"])
+    text = (
+        f"🛡 <b>Проверка на бота</b> — шаг {sess['step']}/{CAPTCHA_STEPS}\n\n"
+        f"{note}{sess['text']}\n\n"
+        f"⏱ На ответ {CAPTCHA_STEP_TIME} сек. Ошибок осталось: {CAPTCHA_MAX_FAILS - sess['fails']}"
+    )
+    return text, kb.as_markup()
+
+
+async def begin_captcha(message: Message):
+    uid = message.from_user.id
+    left = captcha_lock.get(uid, 0) - time.time()
+    if left > 0:
+        await message.answer(f"🚫 Слишком много ошибок. Повторите через {int(left // 60) + 1} мин.")
+        return
+    sess = {"step": 1, "fails": captcha_fails.get(uid, 0)}
+    captcha[uid] = sess
+    _next_puzzle(sess)
+    text, kb = _captcha_view(sess)
+    await message.answer(text, reply_markup=kb)
+
+
+def needs_captcha(uid: int) -> bool:
+    return not is_admin(uid) and not ensure_user(uid)["verified"]
+
+
+@dp.callback_query(F.data.startswith("cap_"))
+async def captcha_answer(cb: CallbackQuery):
+    uid = cb.from_user.id
+    try:
+        _, nonce, idx_s = cb.data.split("_")
+        idx = int(idx_s)
+    except ValueError:
+        await cb.answer()
+        return
+    sess = captcha.get(uid)
+    if not sess or sess["nonce"] != nonce:
+        await cb.answer("Эта проверка устарела. Нажмите /start", show_alert=True)
+        return
+    now = time.time()
+    if now - sess["shown"] > CAPTCHA_STEP_TIME:
+        captcha.pop(uid, None)
+        await cb.answer("Время вышло. Нажмите /start, чтобы начать заново.", show_alert=True)
+        return
+
+    if idx == sess["correct"] and now - sess["shown"] >= CAPTCHA_MIN_DELAY:
+        if sess["step"] >= CAPTCHA_STEPS:
+            captcha.pop(uid, None)
+            captcha_fails.pop(uid, None)
+            ensure_user(uid)
+            q("UPDATE users SET verified=1 WHERE user_id=?", (uid,))
+            kb = InlineKeyboardBuilder()
+            kb.button(text="🚀 Начать", callback_data="begin")
+            await safe_edit(cb, "✅ <b>Проверка пройдена!</b>\n\n" + ABOUT, kb.as_markup())
+            return
+        sess["step"] += 1
+        _next_puzzle(sess)
+        text, kb = _captcha_view(sess, "✅ Верно!\n\n")
+        await safe_edit(cb, text, kb)
+        return
+
+    # ошибка (или слишком быстрый ответ)
+    fails = captcha_fails.get(uid, 0) + 1
+    captcha_fails[uid] = fails
+    if fails >= CAPTCHA_MAX_FAILS:
+        captcha.pop(uid, None)
+        captcha_fails.pop(uid, None)
+        captcha_lock[uid] = now + CAPTCHA_LOCK
+        try:
+            await cb.message.edit_text(f"🚫 Слишком много ошибок. Повторите через {CAPTCHA_LOCK // 60} мин.")
+        except TelegramBadRequest:
+            pass
+        await cb.answer("Проверка не пройдена", show_alert=True)
+        return
+    sess["fails"] = fails
+    sess["step"] = 1
+    _next_puzzle(sess)
+    text, kb = _captcha_view(sess, "❌ Неверно, начинаем заново.\n\n")
+    try:
+        await cb.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        pass
+    await cb.answer("❌ Неверно")
+
+
 @dp.message(CommandStart())
 async def start(message: Message):
-    ensure_user(message.from_user.id)
+    uid = message.from_user.id
+    ensure_user(uid)
+    if needs_captcha(uid):
+        await begin_captcha(message)
+        return
     kb = InlineKeyboardBuilder()
     kb.button(text="🚀 Начать", callback_data="begin")
     await message.answer(ABOUT, reply_markup=kb.as_markup())
@@ -247,6 +418,9 @@ async def start(message: Message):
 
 @dp.message(Command("menu"))
 async def menu_cmd(message: Message):
+    if needs_captcha(message.from_user.id):
+        await begin_captcha(message)
+        return
     if is_active(message.from_user.id):
         await message.answer(cabinet_text(message.from_user.id), reply_markup=cabinet_kb())
     else:
@@ -855,16 +1029,21 @@ async def on_business_message(m: Message):
                         message_id=m.message_id,
                         parse_mode=None,
                     )
-                except Exception:
+                except Exception as e:
                     logging.exception("autofont edit failed")
                     if owner not in font_fail_notified:
                         font_fail_notified.add(owner)
                         try:
                             await bot.send_message(
                                 owner,
-                                "⚠️ Не удалось применить автошрифт к сообщению. Проверьте права бота "
-                                "в Настройки → Telegram для бизнеса → Чат-боты. Также Telegram позволяет "
-                                "править сообщения не старше 48 часов.",
+                                "⚠️ Не удалось применить автошрифт к сообщению.\n\n"
+                                "Что проверить:\n"
+                                "1. Настройки → Telegram для бизнеса → Чат-боты → у бота включено "
+                                "«Отвечать на сообщения».\n"
+                                "2. Чат входит в список, где бот разрешён.\n"
+                                "3. Telegram даёт боту править сообщения только в чатах, где собеседник "
+                                "писал за последние 24 часа.\n\n"
+                                f"Ответ Telegram: {esc(str(e))[:300]}",
                             )
                         except Exception:
                             pass
@@ -975,6 +1154,7 @@ async def help_cmd(message: Message):
         "Для владельцев: /mute и /unmute в чате с человеком, /font текст\n\n"
         "/give id дни — выдать/продлить доступ (например /give 123456 30)\n"
         "/revoke id — отозвать доступ\n"
+        "/verify id — пропустить проверку на бота для пользователя\n"
         "/check id — статус пользователя\n"
         "/stats_admin — общая статистика\n"
         "/users — последние пользователи"
@@ -1002,6 +1182,24 @@ async def give(message: Message):
         await bot.send_message(uid, f"🎉 Вам выдан доступ на <b>{days} дн.</b>\nОткройте /menu и подключите бота (кнопка «Как подключить»).")
     except Exception:
         await message.answer("(пользователь ещё не писал боту — уведомление не доставлено, но доступ выдан)")
+
+
+@dp.message(Command("verify"))
+async def verify_cmd(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    try:
+        _, uid_s = message.text.split()
+        uid = int(uid_s)
+    except ValueError:
+        await message.answer("Использование: /verify <id>")
+        return
+    ensure_user(uid)
+    q("UPDATE users SET verified=1 WHERE user_id=?", (uid,))
+    captcha.pop(uid, None)
+    captcha_fails.pop(uid, None)
+    captcha_lock.pop(uid, None)
+    await message.answer(f"Пользователь {uid} отмечен как проверенный.")
 
 
 @dp.message(Command("revoke"))
