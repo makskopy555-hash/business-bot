@@ -2,6 +2,7 @@ import asyncio
 import html
 import logging
 import os
+import re
 import sqlite3
 import time
 
@@ -47,6 +48,7 @@ bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 BOT_USERNAME = ""
 font_wait = set()  # кто сейчас в разделе «Шрифты» и ждёт текст
+font_fail_notified = set()  # кому уже сообщили, что автошрифт не применился
 
 # ─────────────────────────────────────────────
 # БАЗА (sqlite — файл рядом с ботом / на Volume)
@@ -86,6 +88,11 @@ db.executescript(
     """
 )
 db.commit()
+try:
+    db.execute("ALTER TABLE users ADD COLUMN font_idx INTEGER DEFAULT -1")
+    db.commit()
+except sqlite3.OperationalError:
+    pass  # колонка уже есть
 
 
 def q(sql: str, args: tuple = ()):
@@ -499,19 +506,82 @@ def fonts_text(text: str) -> str:
     return "".join(parts)
 
 
+_SKIP_PREFIX = ("http://", "https://", "www.", "#", "/", "$")
+_ALLOWED_ENT = {"url", "mention", "hashtag", "cashtag", "bot_command", "email", "phone_number"}
+
+
+def stylize_smart(mapping, text: str) -> str:
+    # ссылки, @упоминания, #теги и команды не трогаем, чтобы они не сломались
+    out = []
+    for p in re.split(r"(\s+)", text):
+        if not p or p.isspace() or p.lower().startswith(_SKIP_PREFIX) or "://" in p or "@" in p:
+            out.append(p)
+        else:
+            out.append(stylize(mapping, p))
+    return "".join(out)
+
+
+def entities_ok(m: Message) -> bool:
+    # сообщения с жирным/курсивом/ссылками-текстом и т.п. пропускаем: при правке форматирование бы потерялось
+    return all(e.type in _ALLOWED_ENT for e in (m.entities or []))
+
+
+def current_font(uid: int) -> int:
+    idx = ensure_user(uid)["font_idx"]
+    return idx if idx is not None and 0 <= idx < len(FONT_STYLES) else -1
+
+
+def fonts_screen_text(uid: int) -> str:
+    idx = current_font(uid)
+    now = esc(FONT_STYLES[idx][0]) if idx >= 0 else "выключен"
+    return (
+        "🔤 <b>Шрифты</b>\n\n"
+        f"<b>Автошрифт сейчас: {now}</b>\n"
+        "Выберите шрифт ниже — и все ваши сообщения в подключённых чатах бот будет автоматически "
+        "переписывать этим шрифтом.\n\n"
+        "ℹ️ Как это работает: бот правит ваше сообщение после отправки, поэтому у него появится пометка "
+        "«изменено», а собеседник может на миг увидеть оригинал. Ссылки, @упоминания и команды не меняются, "
+        "сообщения с форматированием пропускаются. Нужна подписка и подключённый бот.\n\n"
+        f"Просто перевести текст: отправьте его сюда (до {FONT_MAX} символов) — пришлю во всех шрифтах. "
+        f"Без захода в бота: <code>@{esc(BOT_USERNAME)} ваш текст</code> в любом чате."
+    )
+
+
+def fonts_screen_kb(uid: int):
+    idx = current_font(uid)
+    kb = InlineKeyboardBuilder()
+    for i, (title, _) in enumerate(FONT_STYLES):
+        kb.button(text=("✅ " if i == idx else "") + title, callback_data=f"fs_{i}")
+    kb.button(text="❌ Выключить автошрифт", callback_data="fs_off")
+    kb.button(text="⬅️ Назад", callback_data="cabinet")
+    kb.adjust(*([2] * ((len(FONT_STYLES) + 1) // 2)), 1, 1)
+    return kb.as_markup()
+
+
 @dp.callback_query(F.data == "fonts")
 async def fonts(cb: CallbackQuery):
     font_wait.add(cb.from_user.id)
-    await safe_edit(
-        cb,
-        "🔤 <b>Шрифты</b>\n\n"
-        f"Отправьте мне любой текст (до {FONT_MAX} символов) — пришлю его во всех шрифтах. "
-        "Нажмите на нужный вариант, чтобы скопировать.\n\n"
-        f"Без захода в бота: в любом чате напишите <code>@{esc(BOT_USERNAME)} ваш текст</code> "
-        "и выберите шрифт из списка.\n\n"
-        "Можно и командой: <code>/font текст</code>",
-        back_kb(),
-    )
+    await safe_edit(cb, fonts_screen_text(cb.from_user.id), fonts_screen_kb(cb.from_user.id))
+
+
+@dp.callback_query(F.data.startswith("fs_"))
+async def font_set(cb: CallbackQuery):
+    if not require_active(cb):
+        await cb.answer("Автошрифт доступен с подпиской", show_alert=True)
+        return
+    val = cb.data[3:]
+    idx = -1
+    if val != "off":
+        try:
+            idx = int(val)
+        except ValueError:
+            idx = -1
+        if not 0 <= idx < len(FONT_STYLES):
+            idx = -1
+    ensure_user(cb.from_user.id)
+    q("UPDATE users SET font_idx=? WHERE user_id=?", (idx, cb.from_user.id))
+    font_fail_notified.discard(cb.from_user.id)
+    await safe_edit(cb, fonts_screen_text(cb.from_user.id), fonts_screen_kb(cb.from_user.id))
 
 
 @dp.message(Command("font"))
@@ -519,7 +589,10 @@ async def font_cmd(message: Message):
     text = message.text.partition(" ")[2].strip()
     if not text:
         font_wait.add(message.from_user.id)
-        await message.answer("🔤 Отправьте текст — пришлю его во всех шрифтах.", reply_markup=back_kb())
+        await message.answer(
+            fonts_screen_text(message.from_user.id),
+            reply_markup=fonts_screen_kb(message.from_user.id),
+        )
         return
     await message.answer(fonts_text(text), reply_markup=back_kb())
 
@@ -767,6 +840,34 @@ async def on_business_message(m: Message):
                 except Exception:
                     logging.exception("mute notice failed")
             return
+
+    # автошрифт: переписываем сообщение владельца выбранным шрифтом
+    if sender and sender.id == owner and m.text and not m.text.startswith("/"):
+        idx = current_font(owner)
+        if idx >= 0 and entities_ok(m):
+            new_text = stylize_smart(FONT_STYLES[idx][1], m.text)
+            if new_text != m.text and len(new_text) <= 4096:
+                try:
+                    await bot.edit_message_text(
+                        new_text,
+                        business_connection_id=conn,
+                        chat_id=m.chat.id,
+                        message_id=m.message_id,
+                        parse_mode=None,
+                    )
+                except Exception:
+                    logging.exception("autofont edit failed")
+                    if owner not in font_fail_notified:
+                        font_fail_notified.add(owner)
+                        try:
+                            await bot.send_message(
+                                owner,
+                                "⚠️ Не удалось применить автошрифт к сообщению. Проверьте права бота "
+                                "в Настройки → Telegram для бизнеса → Чат-боты. Также Telegram позволяет "
+                                "править сообщения не старше 48 часов.",
+                            )
+                        except Exception:
+                            pass
 
     # автоответчик: только на сообщения собеседника, не чаще раза в AWAY_COOLDOWN
     u = ensure_user(owner)
